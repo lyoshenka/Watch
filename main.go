@@ -22,12 +22,16 @@ import (
 
 var (
 	debug     = flag.Bool("v", false, "Enable verbose debugging output")
-	term      = flag.Bool("t", false, "Just run in the terminal (instead of an acme win)")
 	exclude   = flag.String("x", "", "Exclude files and directories matching this regular expression")
 	watchPath = flag.String("p", ".", "The path to watch")
+	ignore    = flag.String("i", "", "Ignore events on files and directories matching this regular expression")
+	basedir   = flag.String("b", "", "All changed files will be reported relative to this base directory")
 )
 
 var excludeRe *regexp.Regexp
+var ignoreRe *regexp.Regexp
+var basedirRe *regexp.Regexp
+var lastChangedFiles []string
 
 const rebuildDelay = 200 * time.Millisecond
 
@@ -75,21 +79,28 @@ func main() {
 	}
 
 	ui := ui(writerUI{os.Stdout})
-	if !*term {
-		wd, err := os.Getwd()
-		if err != nil {
-			log.Fatalln("Failed to get the current directory")
-		}
-		if ui, err = newWin(wd); err != nil {
-			log.Fatalln("Failed to open a win:", err)
-		}
-	}
 
 	if *exclude != "" {
 		var err error
 		excludeRe, err = regexp.Compile(*exclude)
 		if err != nil {
 			log.Fatalln("Bad regexp: ", *exclude)
+		}
+	}
+
+	if *ignore != "" {
+		var err error
+		ignoreRe, err = regexp.Compile(*ignore)
+		if err != nil {
+			log.Fatalln("Bad regexp: ", *ignore)
+		}
+	}
+
+	if *basedir != "" {
+		var err error
+		basedirRe, err = regexp.Compile("^" + regexp.QuoteMeta(*basedir) + "/")
+		if err != nil {
+			log.Fatalln("Bad basedir: ", *basedir)
 		}
 	}
 
@@ -116,7 +127,8 @@ func main() {
 
 func run(ui ui) time.Time {
 	ui.redisplay(func(out io.Writer) {
-		cmd := exec.Command(flag.Arg(0), flag.Args()[1:]...)
+                args := append(flag.Args(), relativize(lastChangedFiles)...)
+		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Stdout = out
 		cmd.Stderr = out
 		if hasSetPGID {
@@ -124,7 +136,7 @@ func run(ui ui) time.Time {
 			reflect.ValueOf(&attr).Elem().FieldByName(setpgidName).SetBool(true)
 			cmd.SysProcAttr = &attr
 		}
-		io.WriteString(out, strings.Join(flag.Args(), " ")+"\n")
+		io.WriteString(out, "\nRUNNING "+strings.Join(args, " ")+"\n")
 		start := time.Now()
 		if err := cmd.Start(); err != nil {
 			io.WriteString(out, "fatal: "+err.Error()+"\n")
@@ -135,6 +147,8 @@ func run(ui ui) time.Time {
 		}
 		io.WriteString(out, time.Now().String()+"\n")
 	})
+
+	lastChangedFiles = []string{}
 
 	return time.Now()
 }
@@ -212,11 +226,16 @@ func sendChanges(w *fsnotify.Watcher, changes chan<- time.Time) {
 		case ev := <-w.Events:
 			time, err := modTime(ev.Name)
 			if err != nil {
-				log.Printf("Failed to get even time: %s", err)
+				log.Printf("Failed to get event time: %s", err)
 				continue
 			}
 
 			debugPrint("%s at %s", ev, time)
+
+			if ignoreRe != nil && ignoreRe.MatchString(path.Base(ev.Name)) {
+				debugPrint("ignoring %s", ev.Name)
+				continue
+			}
 
 			if ev.Op&fsnotify.Create != 0 {
 				switch isdir, err := isDir(ev.Name); {
@@ -229,6 +248,7 @@ func sendChanges(w *fsnotify.Watcher, changes chan<- time.Time) {
 				}
 			}
 
+			lastChangedFiles = appendIfMissing(lastChangedFiles, ev.Name)
 			changes <- time
 		}
 	}
@@ -301,6 +321,27 @@ func isDir(p string) (bool, error) {
 	default:
 		return s.IsDir(), nil
 	}
+}
+
+func appendIfMissing(slice []string, s string) []string {
+	for _, ele := range slice {
+		if ele == s {
+			return slice
+		}
+	}
+	return append(slice, s)
+}
+
+func relativize(files []string) []string {
+	if basedirRe == nil {
+		return files
+	}
+
+	relative := []string{}
+	for _, file := range files {
+		relative = append(relative, basedirRe.ReplaceAllLiteralString(file, ""))
+	}
+	return relative
 }
 
 func debugPrint(f string, vals ...interface{}) {
