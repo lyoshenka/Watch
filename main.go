@@ -127,7 +127,7 @@ func main() {
 
 func run(ui ui) time.Time {
 	ui.redisplay(func(out io.Writer) {
-                args := append(flag.Args(), relativize(lastChangedFiles)...)
+		args := append(flag.Args(), relativize(lastChangedFiles)...)
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Stdout = out
 		cmd.Stderr = out
